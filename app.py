@@ -1,18 +1,21 @@
 # coding=utf-8
-# Qwen3-TTS Gradio Demo for HuggingFace Spaces with Zero GPU
+# Qwen3-TTS Gradio Demo for AMD GPU with DirectML
 # Supports: Voice Design, Voice Clone (Base), TTS (CustomVoice)
-#import subprocess
-#subprocess.run('pip install flash-attn==2.7.4.post1', shell=True)
 import os
-import spaces
 import gradio as gr
 import numpy as np
 import torch
+
+try:
+    import torch_directml
+    device = torch_directml.device()
+    print(f"Using DirectML device: {device}")
+except ImportError:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using fallback device: {device}")
+
 from huggingface_hub import snapshot_download, login
 from qwen_tts import Qwen3TTSModel
-
-# HF_TOKEN = os.environ.get('HF_TOKEN')
-# login(token=HF_TOKEN)
 
 # Model size options
 MODEL_SIZES = ["0.6B", "1.7B"]
@@ -30,70 +33,27 @@ def get_model_path(model_type: str, model_size: str) -> str:
 
 
 # ============================================================================
-# GLOBAL MODEL LOADING - Load all models at startup
+# MODEL LOADING - Lazy loading with caching for DirectML / local execution
 # ============================================================================
-print("Loading all models to CUDA...")
+MODEL_CACHE = {}
 
-# Voice Design model (1.7B only)
-print("Loading VoiceDesign 1.7B model...")
-voice_design_model = Qwen3TTSModel.from_pretrained(
-    get_model_path("VoiceDesign", "1.7B"),
-    device_map="cuda",
-    dtype=torch.bfloat16,
-    # token=HF_TOKEN,
-    attn_implementation="sdpa",
-)
 
-# Base (Voice Clone) models - both sizes
-print("Loading Base 0.6B model...")
-base_model_0_6b = Qwen3TTSModel.from_pretrained(
-    get_model_path("Base", "0.6B"),
-    device_map="cuda",
-    dtype=torch.bfloat16,
-    # token=HF_TOKEN,
-    attn_implementation="sdpa",
-)
-
-print("Loading Base 1.7B model...")
-base_model_1_7b = Qwen3TTSModel.from_pretrained(
-    get_model_path("Base", "1.7B"),
-    device_map="cuda",
-    dtype=torch.bfloat16,
-    # token=HF_TOKEN,
-    attn_implementation="sdpa",
-)
-
-# CustomVoice models - both sizes
-print("Loading CustomVoice 0.6B model...")
-custom_voice_model_0_6b = Qwen3TTSModel.from_pretrained(
-    get_model_path("CustomVoice", "0.6B"),
-    device_map="cuda",
-    dtype=torch.bfloat16,
-    # token=HF_TOKEN,
-    attn_implementation="sdpa",
-)
-
-print("Loading CustomVoice 1.7B model...")
-custom_voice_model_1_7b = Qwen3TTSModel.from_pretrained(
-    get_model_path("CustomVoice", "1.7B"),
-    device_map="cuda",
-    dtype=torch.bfloat16,
-    # token=HF_TOKEN,
-    attn_implementation="sdpa",
-)
-
-print("All models loaded successfully!")
-
-# Model lookup dictionaries for easy access
-BASE_MODELS = {
-    "0.6B": base_model_0_6b,
-    "1.7B": base_model_1_7b,
-}
-
-CUSTOM_VOICE_MODELS = {
-    "0.6B": custom_voice_model_0_6b,
-    "1.7B": custom_voice_model_1_7b,
-}
+def get_loaded_model(model_type: str, model_size: str) -> Qwen3TTSModel:
+    """Load model on demand and cache it on the DirectML device."""
+    key = f"{model_type}_{model_size}"
+    if key not in MODEL_CACHE:
+        print(f"Loading {model_type} ({model_size}) model to {device}...")
+        dtype = torch.float16 if device.type != "cpu" else torch.float32
+        model_wrapper = Qwen3TTSModel.from_pretrained(
+            get_model_path(model_type, model_size),
+            dtype=dtype,
+            attn_implementation="sdpa",
+        )
+        model_wrapper.model.to(device)
+        model_wrapper.device = next(model_wrapper.model.parameters()).device
+        MODEL_CACHE[key] = model_wrapper
+        print(f"Model {key} loaded successfully!")
+    return MODEL_CACHE[key]
 
 # ============================================================================
 
@@ -144,7 +104,6 @@ def _audio_to_tuple(audio):
     return None
 
 
-@spaces.GPU(duration=60)
 def generate_voice_design(text, language, voice_description, progress=gr.Progress(track_tqdm=True)):
     """Generate speech using Voice Design model (1.7B only)."""
     if not text or not text.strip():
@@ -153,7 +112,8 @@ def generate_voice_design(text, language, voice_description, progress=gr.Progres
         return None, "Error: Voice description is required."
 
     try:
-        wavs, sr = voice_design_model.generate_voice_design(
+        model = get_loaded_model("VoiceDesign", "1.7B")
+        wavs, sr = model.generate_voice_design(
             text=text.strip(),
             language=language,
             instruct=voice_description.strip(),
@@ -165,7 +125,6 @@ def generate_voice_design(text, language, voice_description, progress=gr.Progres
         return None, f"Error: {type(e).__name__}: {e}"
 
 
-@spaces.GPU(duration=60)
 def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector_only, model_size, progress=gr.Progress(track_tqdm=True)):
     """Generate speech using Base (Voice Clone) model."""
     if not target_text or not target_text.strip():
@@ -179,7 +138,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         return None, "Error: Reference text is required when 'Use x-vector only' is not enabled."
 
     try:
-        tts = BASE_MODELS[model_size]
+        tts = get_loaded_model("Base", model_size)
         wavs, sr = tts.generate_voice_clone(
             text=target_text.strip(),
             language=language,
@@ -193,7 +152,6 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         return None, f"Error: {type(e).__name__}: {e}"
 
 
-@spaces.GPU(duration=60)
 def generate_custom_voice(text, language, speaker, instruct, model_size, progress=gr.Progress(track_tqdm=True)):
     """Generate speech using CustomVoice model."""
     if not text or not text.strip():
@@ -202,7 +160,7 @@ def generate_custom_voice(text, language, speaker, instruct, model_size, progres
         return None, "Error: Speaker is required."
 
     try:
-        tts = CUSTOM_VOICE_MODELS[model_size]
+        tts = get_loaded_model("CustomVoice", model_size)
         wavs, sr = tts.generate_custom_voice(
             text=text.strip(),
             language=language,
@@ -230,7 +188,7 @@ def build_ui():
     with gr.Blocks(theme=theme, css=css, title="Qwen3-TTS Demo") as demo:
         gr.Markdown(
             """
-# Qwen3-TTS Demo
+# Qwen3-TTS Demo (AMD GPU DirectML)
 A unified Text-to-Speech demo featuring three powerful modes:
 - **Voice Design**: Create custom voices using natural language descriptions
 - **Voice Clone (Base)**: Clone any voice from a reference audio
@@ -376,8 +334,7 @@ Built with [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by Alibaba Qwen Team
         gr.Markdown(
             """
 ---
-**Note**: This demo uses HuggingFace Spaces Zero GPU. Each generation has a time limit.
-For longer texts, please split them into smaller segments.
+**Note**: Running locally on AMD GPU via DirectML. Models are loaded on demand upon first request.
 """
         )
 
@@ -386,4 +343,4 @@ For longer texts, please split them into smaller segments.
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch()
+    demo.launch()

@@ -1,14 +1,17 @@
-# Qwen3-TTS Dependencies for HuggingFace Spaces
-torch==2.8.0
-transformers==4.57.3
-accelerate==1.12.0
+# --- PyTorch & DirectML para GPU AMD ---
+torch-directml
+
+# --- Processamento de Áudio ---
+torchaudio
+soundfile
+librosa
+
+# --- Hugging Face & Utilitários ---
+transformers>=4.45.0
+accelerate
 einops
 gradio
-librosa
-torchaudio==2.8.0
-soundfile
-sox
-onnxruntime
-spaces
 numpy
-kernels
+
+# --- ONNX Runtime para DirectML (Opcional se usar ONNX) ---
+onnxruntime-directml
